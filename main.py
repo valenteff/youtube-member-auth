@@ -7,19 +7,23 @@ Routes:
   GET  /auth/google/callback     — OAuth callback for client flow
   GET  /admin/login              — Redirect to Google OAuth (creator flow)
   GET  /admin/google/callback    — OAuth callback for creator flow
-  GET  /admin/sync               — Manually trigger member sync
+  GET  /admin/sync               — Manually trigger member sync (requires admin key)
   GET  /protected/strategy-code  — Protected endpoint (requires active membership)
   GET  /health                   — Health check
 """
 from __future__ import annotations
 
+import asyncio
+import secrets
 import logging
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, Request, HTTPException
+from typing import Optional
+from fastapi import FastAPI, Request, HTTPException, Depends, Header, Cookie
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.middleware.cors import CORSMiddleware
 from jose import jwt
 
 from config import settings
@@ -42,7 +46,20 @@ logging.basicConfig(
 logger = logging.getLogger("app")
 
 
-# ────────────────── Lifespan (startup/shutdown) ──────────────────
+# ────────────────── Admin auth dependency ──────────────────
+
+async def require_admin(x_admin_key: str = Header(default="")):
+    """Require a valid admin API key for /admin/* management endpoints."""
+    if not settings.ADMIN_API_KEY:
+        # If no admin key is configured, only allow from localhost
+        # This is a PoC safety net — set ADMIN_API_KEY in .env for production
+        raise HTTPException(503, "ADMIN_API_KEY not configured. Set it in .env.")
+    if not x_admin_key or x_admin_key != settings.ADMIN_API_KEY:
+        raise HTTPException(403, "Admin access required")
+    return True
+
+
+# ────────────────── Lifespan ──────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -51,25 +68,51 @@ async def lifespan(app: FastAPI):
     logger.info("Starting background sync task...")
     task = asyncio.create_task(sync_loop())
     yield
+    # Graceful shutdown
     task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    await db.close_db()
     logger.info("Shutdown complete.")
 
 
-import asyncio
+app = FastAPI(title="YouTube Member Auth PoC", version="1.1.0", lifespan=lifespan)
 
-app = FastAPI(title="YouTube Member Auth PoC", version="1.0.0", lifespan=lifespan)
+# ── Middleware ──
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[settings.CLIENT_REDIRECT_URI.rsplit("/", 3)[0]],  # origin only
+    allow_credentials=True,
+    allow_methods=["GET"],
+    allow_headers=["Authorization", "Content-Type"],
+)
 app.add_middleware(MemberAuthMiddleware)
 
 
-# ────────────────── Helpers ──────────────────
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return response
+
+
+# ────────────────── JWT helper ──────────────────
 
 def _make_jwt(user_id: str, email: str, channel_id: str | None) -> str:
     payload = {
         "sub": user_id,
         "email": email,
         "channel_id": channel_id,
-        "exp": datetime.now(timezone.utc) + timedelta(hours=24),
+        "iss": settings.JWT_ISSUER,
+        "aud": settings.JWT_AUDIENCE,
+        "exp": datetime.now(timezone.utc) + timedelta(minutes=settings.JWT_EXPIRY_MINUTES),
         "iat": datetime.now(timezone.utc),
+        "jti": secrets.token_hex(16),  # unique token ID for revocation tracking
     }
     return jwt.encode(payload, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)
 
@@ -87,7 +130,7 @@ async def index():
       <ul>
         <li><a href="/login">/login</a> — Login with Google (user flow)</li>
         <li><a href="/admin/login">/admin/login</a> — Creator OAuth (one-time setup)</li>
-        <li><a href="/admin/sync">/admin/sync</a> — Manually trigger member sync</li>
+        <li><code>/admin/sync</code> — Manually trigger sync (requires X-Admin-Key header)</li>
         <li><code>/protected/strategy-code</code> — Protected endpoint (needs JWT + membership)</li>
         <li><a href="/health">/health</a> — Health check</li>
       </ul>
@@ -99,43 +142,79 @@ async def index():
 
 @app.get("/login")
 async def login():
-    """Redirect user to Google OAuth consent."""
-    state = f"user-{datetime.now().timestamp()}"
+    """Redirect user to Google OAuth consent with CSRF-protected state."""
+    state = secrets.token_urlsafe(32)
     auth_url = build_client_auth_url(state)
-    return RedirectResponse(auth_url)
+    response = RedirectResponse(auth_url)
+    response.set_cookie(
+        "oauth_state", state,
+        httponly=True, secure=False, samesite="lax",  # secure=True in production (HTTPS)
+        max_age=600,  # 10 minutes
+    )
+    return response
 
 
 @app.get("/auth/google/callback")
-async def client_callback(code: str, state: str = "", error: str = ""):
+async def client_callback(
+    code: str = "",
+    state: str = "",
+    error: str = "",
+    oauth_state: Optional[str] = Cookie(default=None),
+):
     """Handle Google OAuth callback for end-users."""
     if error:
         raise HTTPException(400, f"OAuth error: {error}")
 
-    # Exchange code → tokens
-    token_data = await exchange_code_for_tokens(code, settings.CLIENT_REDIRECT_URI)
-    access_token = token_data["access_token"]
+    # ── CSRF protection: validate state cookie ──
+    if not state or not oauth_state or state != oauth_state:
+        raise HTTPException(400, "Invalid state parameter — possible CSRF attack")
 
-    # Get user info
-    userinfo = await get_userinfo(access_token)
-    user_id = userinfo["sub"]
+    # ── Input validation ──
+    if not code or len(code) > 256:
+        raise HTTPException(400, "Invalid authorization code")
+
+    # ── Exchange code → tokens ──
+    try:
+        token_data = await exchange_code_for_tokens(code, settings.CLIENT_REDIRECT_URI)
+    except RuntimeError as e:
+        raise HTTPException(502, str(e))
+
+    access_token = token_data.get("access_token")
+    if not access_token:
+        raise HTTPException(502, "OAuth provider did not return access_token")
+
+    # ── Get user info ──
+    try:
+        userinfo = await get_userinfo(access_token)
+    except RuntimeError as e:
+        raise HTTPException(502, str(e))
+
+    user_id = userinfo.get("sub")
+    if not user_id:
+        raise HTTPException(502, "OAuth provider did not return subject")
+
     email = userinfo.get("email", "")
 
     # Try to get YouTube channel ID
     channel_id = await get_youtube_channel_id(access_token)
 
-    # Save to DB
-    await db.upsert_user(user_id, email, channel_id, access_token)
+    # Save to DB (no access_token stored)
+    await db.upsert_user(user_id, email, channel_id)
 
     # Issue JWT
     jwt_token = _make_jwt(user_id, email, channel_id)
 
-    return JSONResponse({
+    # Clear state cookie
+    response = JSONResponse({
         "message": "Login successful",
         "email": email,
         "youtube_channel_id": channel_id,
         "jwt": jwt_token,
+        "expires_in_minutes": settings.JWT_EXPIRY_MINUTES,
         "instructions": "Use this JWT in the Authorization header: Bearer <token>",
     })
+    response.delete_cookie("oauth_state")
+    return response
 
 
 # ────────────────── Creator (Admin) OAuth Flow ──────────────────
@@ -143,52 +222,81 @@ async def client_callback(code: str, state: str = "", error: str = ""):
 @app.get("/admin/login")
 async def admin_login():
     """Redirect creator to Google OAuth with channel-memberships scope."""
-    state = f"creator-{datetime.now().timestamp()}"
+    state = secrets.token_urlsafe(32)
     auth_url = build_creator_auth_url(state)
-    return RedirectResponse(auth_url)
+    response = RedirectResponse(auth_url)
+    response.set_cookie(
+        "oauth_state", state,
+        httponly=True, secure=False, samesite="lax",
+        max_age=600,
+    )
+    return response
 
 
 @app.get("/admin/google/callback")
-async def creator_callback(code: str, state: str = "", error: str = ""):
+async def creator_callback(
+    code: str = "",
+    state: str = "",
+    error: str = "",
+    oauth_state: Optional[str] = Cookie(default=None),
+):
     """Handle Google OAuth callback for the channel creator."""
     if error:
         raise HTTPException(400, f"OAuth error: {error}")
 
-    token_data = await exchange_code_for_tokens(code, settings.CREATOR_REDIRECT_URI)
+    # ── CSRF protection ──
+    if not state or not oauth_state or state != oauth_state:
+        raise HTTPException(400, "Invalid state parameter — possible CSRF attack")
 
-    access_token = token_data["access_token"]
+    if not code or len(code) > 256:
+        raise HTTPException(400, "Invalid authorization code")
+
+    try:
+        token_data = await exchange_code_for_tokens(code, settings.CREATOR_REDIRECT_URI)
+    except RuntimeError as e:
+        raise HTTPException(502, str(e))
+
+    access_token = token_data.get("access_token")
+    if not access_token:
+        raise HTTPException(502, "OAuth provider did not return access_token")
+
     refresh_token = token_data.get("refresh_token")
-
     if not refresh_token:
         raise HTTPException(
             400,
             "No refresh_token returned. Revoke access at https://myaccount.google.com/permissions "
-            "and try again. You must use prompt=consent and access_type=offline.",
+            "and try again.",
         )
 
     expires_in = token_data.get("expires_in", 3600)
 
     # Get creator's email and channel ID
-    userinfo = await get_userinfo(access_token)
+    try:
+        userinfo = await get_userinfo(access_token)
+    except RuntimeError as e:
+        raise HTTPException(502, str(e))
+
     email = userinfo.get("email", "")
     channel_id = await get_creator_channel_id(access_token)
 
-    # Store creator tokens (single row, id=1)
+    # Store creator tokens
     await db.save_creator_tokens(email, channel_id or "", access_token, refresh_token, expires_in)
 
-    return JSONResponse({
+    response = JSONResponse({
         "message": "Creator authenticated successfully. Server can now sync members offline.",
         "email": email,
         "channel_id": channel_id,
         "has_refresh_token": True,
     })
+    response.delete_cookie("oauth_state")
+    return response
 
 
-# ────────────────── Manual Sync Trigger ──────────────────
+# ────────────────── Manual Sync (admin-protected) ──────────────────
 
-@app.get("/admin/sync")
+@app.get("/admin/sync", dependencies=[Depends(require_admin)])
 async def manual_sync():
-    """Manually trigger a member sync. Useful for testing."""
+    """Manually trigger a member sync. Requires X-Admin-Key header."""
     success, count, error = await sync_members_once()
     if success:
         return JSONResponse({"status": "ok", "active_members": count})

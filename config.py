@@ -1,10 +1,22 @@
 """
 Configuration loader — reads from environment / .env file.
+Fails fast on missing critical settings.
 """
+from __future__ import annotations
+
 import os
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# ── JWT secret: fail-fast if missing or default ──
+_jwt_secret = os.getenv("JWT_SECRET", "")
+_DEFAULT_SENTINEL = "dev-secret-change-me"
+if not _jwt_secret or _jwt_secret == _DEFAULT_SENTINEL:
+    raise RuntimeError(
+        "JWT_SECRET must be set to a random value. "
+        'Generate with: python -c "import secrets; print(secrets.token_hex(32))"'
+    )
 
 
 class Settings:
@@ -13,8 +25,11 @@ class Settings:
     GOOGLE_CLIENT_SECRET: str = os.getenv("GOOGLE_CLIENT_SECRET", "")
 
     # JWT
-    JWT_SECRET: str = os.getenv("JWT_SECRET", "dev-secret-change-me")
+    JWT_SECRET: str = _jwt_secret
     JWT_ALGORITHM: str = os.getenv("JWT_ALGORITHM", "HS256")
+    JWT_ISSUER: str = "youtube-member-auth"
+    JWT_AUDIENCE: str = "youtube-member-auth"
+    JWT_EXPIRY_MINUTES: int = int(os.getenv("JWT_EXPIRY_MINUTES", "60"))
 
     # Redirect URIs
     CLIENT_REDIRECT_URI: str = os.getenv("CLIENT_REDIRECT_URI", "http://localhost:8000/auth/google/callback")
@@ -27,8 +42,11 @@ class Settings:
     # Database
     DATABASE_PATH: str = os.getenv("DATABASE_PATH", "./members.db")
 
+    # Admin API key for /admin/* endpoints
+    ADMIN_API_KEY: str = os.getenv("ADMIN_API_KEY", "")
+
     # Server
-    HOST: str = os.getenv("HOST", "0.0.0.0")
+    HOST: str = os.getenv("HOST", "127.0.0.1")
     PORT: int = int(os.getenv("PORT", "8000"))
 
     # Sync

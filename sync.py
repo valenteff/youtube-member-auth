@@ -23,7 +23,7 @@ async def sync_members_once():
         return False, 0, msg
 
     try:
-        raw_members = await list_channel_members(access_token)
+        members = await list_channel_members(access_token)
     except QuotaExceededError as e:
         msg = f"Quota exceeded during sync: {e}"
         logger.error(msg)
@@ -33,8 +33,8 @@ async def sync_members_once():
         logger.error(msg)
         return False, 0, msg
 
-    # Overwrite local table
-    await db.replace_active_members(raw_members)
+    # Overwrite local table (atomically)
+    await db.replace_active_members(members)
     count = await db.count_active_members()
     logger.info("Sync complete — %d active members in DB", count)
     return True, count, None
