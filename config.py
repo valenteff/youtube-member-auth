@@ -20,7 +20,7 @@ if not _jwt_secret or _jwt_secret == _DEFAULT_SENTINEL:
 
 
 class Settings:
-    # Google OAuth
+    # Google OAuth — fail-fast if not configured
     GOOGLE_CLIENT_ID: str = os.getenv("GOOGLE_CLIENT_ID", "")
     GOOGLE_CLIENT_SECRET: str = os.getenv("GOOGLE_CLIENT_SECRET", "")
 
@@ -45,6 +45,13 @@ class Settings:
     # Admin API key for /admin/* endpoints
     ADMIN_API_KEY: str = os.getenv("ADMIN_API_KEY", "")
 
+    # Creator email allowlist (comma-separated) — only these Google accounts
+    # can complete the creator OAuth flow
+    CREATOR_ALLOWLIST: str = os.getenv("CREATOR_ALLOWLIST", "")
+
+    # Cookie secure flag — set to True when serving over HTTPS
+    COOKIE_SECURE: bool = os.getenv("COOKIE_SECURE", "false").lower() == "true"
+
     # Server
     HOST: str = os.getenv("HOST", "127.0.0.1")
     PORT: int = int(os.getenv("PORT", "8000"))
@@ -60,3 +67,10 @@ class Settings:
 
 
 settings = Settings()
+
+# ── Validate critical Google credentials at import ──
+if not settings.GOOGLE_CLIENT_ID or not settings.GOOGLE_CLIENT_SECRET:
+    raise RuntimeError(
+        "GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET must be set in .env. "
+        "See README.md for Google Cloud Console setup instructions."
+    )

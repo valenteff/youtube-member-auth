@@ -91,8 +91,8 @@ async def refresh_access_token(refresh_token: str) -> dict:
         resp = await client.post(settings.OAUTH_TOKEN_URL, data=data)
         if resp.status_code != 200:
             err_msg = _safe_error(resp)
-            # Detect revoked / invalid refresh token
-            if "invalid_grant" in err_msg or resp.status_code == 400:
+            # Only clear tokens on confirmed invalid_grant (revoked/expired refresh token)
+            if "invalid_grant" in err_msg.lower():
                 logger.error("Refresh token is invalid or revoked. Clearing creator tokens.")
                 await db.clear_creator_tokens()
                 raise RuntimeError("Refresh token revoked. Admin must re-authenticate via /admin/login.")

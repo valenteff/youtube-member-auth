@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import asyncio
 import secrets
+import hmac
 import logging
+from urllib.parse import urlparse
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 
@@ -49,12 +51,11 @@ logger = logging.getLogger("app")
 # ────────────────── Admin auth dependency ──────────────────
 
 async def require_admin(x_admin_key: str = Header(default="")):
-    """Require a valid admin API key for /admin/* management endpoints."""
+    """Require a valid admin API key for /admin/* management endpoints.
+    Uses constant-time comparison to prevent timing attacks."""
     if not settings.ADMIN_API_KEY:
-        # If no admin key is configured, only allow from localhost
-        # This is a PoC safety net — set ADMIN_API_KEY in .env for production
         raise HTTPException(503, "ADMIN_API_KEY not configured. Set it in .env.")
-    if not x_admin_key or x_admin_key != settings.ADMIN_API_KEY:
+    if not hmac.compare_digest(x_admin_key, settings.ADMIN_API_KEY):
         raise HTTPException(403, "Admin access required")
     return True
 
@@ -78,27 +79,36 @@ async def lifespan(app: FastAPI):
     logger.info("Shutdown complete.")
 
 
-app = FastAPI(title="YouTube Member Auth PoC", version="1.1.0", lifespan=lifespan)
+app = FastAPI(title="YouTube Member Auth PoC", version="1.2.0", lifespan=lifespan)
 
-# ── Middleware ──
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[settings.CLIENT_REDIRECT_URI.rsplit("/", 3)[0]],  # origin only
-    allow_credentials=True,
-    allow_methods=["GET"],
-    allow_headers=["Authorization", "Content-Type"],
-)
-app.add_middleware(MemberAuthMiddleware)
+# ── CORS: derive origin properly from redirect URI ──
+_parsed = urlparse(settings.CLIENT_REDIRECT_URI)
+_cors_origin = f"{_parsed.scheme}://{_parsed.netloc}"
 
-
+# ── Middleware (order matters: outermost is added last) ──
+# Security headers first (innermost, runs after CORS handles preflight)
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
+    # Let CORS middleware handle OPTIONS preflight without interception
     response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["X-XSS-Protection"] = "1; mode=block"
     response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     return response
+
+# CORS middleware (handles OPTIONS preflight before auth middleware blocks it)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[_cors_origin],
+    allow_credentials=True,
+    allow_methods=["GET"],
+    allow_headers=["Authorization", "Content-Type"],
+)
+
+# Auth middleware (outermost — but CORS already handled OPTIONS above
+# because CORSMiddleware is added after and thus wraps it)
+app.add_middleware(MemberAuthMiddleware)
 
 
 # ────────────────── JWT helper ──────────────────
@@ -148,7 +158,7 @@ async def login():
     response = RedirectResponse(auth_url)
     response.set_cookie(
         "oauth_state", state,
-        httponly=True, secure=False, samesite="lax",  # secure=True in production (HTTPS)
+        httponly=True, secure=settings.COOKIE_SECURE, samesite="lax",
         max_age=600,  # 10 minutes
     )
     return response
@@ -219,15 +229,16 @@ async def client_callback(
 
 # ────────────────── Creator (Admin) OAuth Flow ──────────────────
 
-@app.get("/admin/login")
+@app.get("/admin/login", dependencies=[Depends(require_admin)])
 async def admin_login():
-    """Redirect creator to Google OAuth with channel-memberships scope."""
+    """Redirect creator to Google OAuth with channel-memberships scope.
+    Requires X-Admin-Key header — prevents unauthorized creator hijacking."""
     state = secrets.token_urlsafe(32)
     auth_url = build_creator_auth_url(state)
     response = RedirectResponse(auth_url)
     response.set_cookie(
         "oauth_state", state,
-        httponly=True, secure=False, samesite="lax",
+        httponly=True, secure=settings.COOKIE_SECURE, samesite="lax",
         max_age=600,
     )
     return response
@@ -277,6 +288,14 @@ async def creator_callback(
         raise HTTPException(502, str(e))
 
     email = userinfo.get("email", "")
+
+    # ── Creator allowlist: only approved Google accounts can be the creator ──
+    if settings.CREATOR_ALLOWLIST:
+        allowed_emails = [e.strip().lower() for e in settings.CREATOR_ALLOWLIST.split(",") if e.strip()]
+        if email.lower() not in allowed_emails:
+            logger.warning("Creator OAuth rejected — email %s not in allowlist", email)
+            raise HTTPException(403, "This Google account is not authorized as a channel creator.")
+
     channel_id = await get_creator_channel_id(access_token)
 
     # Store creator tokens

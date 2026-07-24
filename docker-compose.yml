@@ -1,0 +1,32 @@
+services:
+  app:
+    build: .
+    container_name: youtube-member-auth
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env          # JWT_SECRET, GOOGLE_CLIENT_ID/SECRET, ADMIN_API_KEY, redirect URIs
+    environment:
+      # These must match the container, not the host .env defaults
+      DATABASE_PATH: /data/members.db
+      HOST: 0.0.0.0
+      PORT: 8000
+      # IMPORTANT: CLIENT_REDIRECT_URI / CREATOR_REDIRECT_URI in .env must use the
+      # public origin (e.g. https://auth.example.com/...) registered in Google Cloud Console.
+    volumes:
+      - member-data:/data        # persists members.db (WAL files included)
+    restart: unless-stopped
+    # SQLite: never scale beyond 1 replica
+    deploy:
+      replicas: 1
+
+  # Optional: terminate TLS + secure cookies in front of the app
+  # caddy:
+  #   image: caddy:2
+  #   ports: ["443:443"]
+  #   volumes:
+  #     - ./Caddyfile:/etc/caddy/Caddyfile
+  #   depends_on: [app]
+
+volumes:
+  member-data:

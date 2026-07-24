@@ -33,10 +33,13 @@ async def sync_members_once():
         logger.error(msg)
         return False, 0, msg
 
-    # Overwrite local table (atomically)
-    await db.replace_active_members(members)
+    # Overwrite local table (atomically, with empty-wipe guard)
+    replaced = await db.replace_active_members(members)
     count = await db.count_active_members()
-    logger.info("Sync complete — %d active members in DB", count)
+    if not replaced:
+        logger.warning("Sync skipped member replacement (empty-wipe guard active)")
+    else:
+        logger.info("Sync complete — %d active members in DB", count)
     return True, count, None
 
 
