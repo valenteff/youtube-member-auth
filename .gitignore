@@ -1,0 +1,10 @@
+# Environment
+.env
+venv/
+__pycache__/
+*.pyc
+members.db
+members.db-journal
+members.db-wal
+members.db-shm
+.DS_Store
