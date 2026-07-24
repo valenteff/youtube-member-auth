@@ -26,7 +26,7 @@ class MemberAuthMiddleware(BaseHTTPMiddleware):
         path = request.url.path
 
         # Only gate /protected/* routes
-        if not path.startswith("/protected"):
+        if path != "/protected" and not path.startswith("/protected/"):
             return await call_next(request)
 
         # ── Extract token from Authorization header ──

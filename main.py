@@ -21,7 +21,6 @@ from urllib.parse import urlparse
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 
-import httpx
 from typing import Optional
 from fastapi import FastAPI, Request, HTTPException, Depends, Header, Cookie
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse

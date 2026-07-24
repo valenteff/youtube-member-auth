@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import logging
 import httpx
+from urllib.parse import urlencode
+from datetime import datetime, timezone
 from config import settings
 import database as db
 
@@ -17,7 +19,6 @@ logger = logging.getLogger("youtube_auth")
 
 def build_client_auth_url(state: str) -> str:
     """Login with Google URL for end-users."""
-    from urllib.parse import urlencode
     params = {
         "client_id": settings.GOOGLE_CLIENT_ID,
         "redirect_uri": settings.CLIENT_REDIRECT_URI,
@@ -32,7 +33,6 @@ def build_client_auth_url(state: str) -> str:
 
 def build_creator_auth_url(state: str) -> str:
     """One-time creator OAuth URL — needs offline access for refresh_token."""
-    from urllib.parse import urlencode
     params = {
         "client_id": settings.GOOGLE_CLIENT_ID,
         "redirect_uri": settings.CREATOR_REDIRECT_URI,
@@ -160,9 +160,14 @@ async def list_channel_members(access_token: str) -> list[dict]:
     raw_members: list[dict] = []
     page_token: str | None = None
     base_url = "https://www.googleapis.com/youtube/v3/members"
+    max_pages = 50  # safety cap: 50 * 50 = 2500 members max
+    pages_fetched = 0
 
     async with httpx.AsyncClient(timeout=30) as client:
         while True:
+            if pages_fetched >= max_pages:
+                logger.warning("Pagination cap reached (%d pages) — stopping", max_pages)
+                break
             params: dict = {"part": "snippet", "maxResults": "50"}
             if page_token:
                 params["pageToken"] = page_token
@@ -193,6 +198,7 @@ async def list_channel_members(access_token: str) -> list[dict]:
 
             data = resp.json()
             raw_members.extend(data.get("items", []))
+            pages_fetched += 1
 
             page_token = data.get("nextPageToken")
             if not page_token:
@@ -225,7 +231,6 @@ async def get_valid_creator_access_token() -> str:
     Return a valid access token for the creator, refreshing if necessary.
     Raises RuntimeError if no creator tokens are stored or refresh fails.
     """
-    from datetime import datetime, timezone
     tokens = await db.get_creator_tokens()
     if not tokens:
         raise RuntimeError("No creator tokens found. Run the admin OAuth flow first.")

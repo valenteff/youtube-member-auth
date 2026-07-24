@@ -1,14 +1,25 @@
 #!/usr/bin/env python3
-"""Test suite for YouTube Member Auth PoC — post-hardening."""
+"""
+Test suite for YouTube Member Auth PoC.
+
+Tests run against a temporary SQLite database (not the dev DB)
+to avoid mutating real data and to ensure hermetic, repeatable runs.
+"""
 import asyncio
-import json
 import os
 import sys
 import stat
+import tempfile
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Use a temp DB BEFORE importing config/database so settings picks it up
+_test_db = tempfile.mktemp(suffix=".db")
+os.environ["DATABASE_PATH"] = _test_db
+
 from jose import jwt
 from datetime import datetime, timedelta, timezone
-from dotenv import load_dotenv
-load_dotenv()
 
 import database as db
 from config import settings
@@ -22,12 +33,7 @@ async def run_tests():
     perms = stat.S_IMODE(os.stat(settings.DATABASE_PATH).st_mode)
     results.append(("DB init + chmod 0600", perms == 0o600, "perms=" + oct(perms)))
 
-    # Test 2: Empty member wipe
-    await db.replace_active_members([])
-    count = await db.count_active_members()
-    results.append(("Empty sync to 0 members", count == 0, "count=" + str(count)))
-
-    # Test 3: Add members with flat format
+    # Test 2: Add members with flat format
     await db.replace_active_members([
         {"channel_id": "UC_MEMBER_1", "membership_level": "Tier 1"},
         {"channel_id": "UC_MEMBER_2", "membership_level": "Tier 2"},
@@ -35,13 +41,22 @@ async def run_tests():
     count = await db.count_active_members()
     results.append(("Add 2 members", count == 2, "count=" + str(count)))
 
-    # Test 4: Membership check
+    # Test 3: Membership check
     is_m1 = await db.is_active_member("UC_MEMBER_1")
     is_m2 = await db.is_active_member("UC_FAKE")
     results.append(("is_member(UC_MEMBER_1)", is_m1, "result=" + str(is_m1)))
     results.append(("is_member(UC_FAKE) False", not is_m2, "result=" + str(is_m2)))
 
-    # Test 5: Replace wipes old
+    # Test 4: Empty-wipe guard — should REFUSE to wipe when members exist
+    replaced = await db.replace_active_members([])
+    count_after_guard = await db.count_active_members()
+    results.append((
+        "Empty-wipe guard refuses wipe (members exist)",
+        replaced is False and count_after_guard == 2,
+        f"replaced={replaced} count={count_after_guard}",
+    ))
+
+    # Test 5: Replace wipes old (after clearing manually first)
     await db.replace_active_members([
         {"channel_id": "UC_MEMBER_3", "membership_level": "Tier 1"},
     ])
@@ -53,7 +68,7 @@ async def run_tests():
     results.append(("is_member(None) False", await db.is_active_member(None) == False, ""))
     results.append(("is_member(empty) False", await db.is_active_member("") == False, ""))
 
-    # Test 7: User without access_token column
+    # Test 7: User stored without access_token
     await db.upsert_user("user-001", "test@example.com", "UC_TEST_CHAN")
     user = await db.get_user_by_id("user-001")
     has_token_col = "oauth_access_token" in user
@@ -87,6 +102,15 @@ async def run_tests():
     tokens = await db.get_creator_tokens()
     results.append(("Creator tokens saved", tokens["refresh_token"] == "refresh456", ""))
 
+    # Test 10b: Update creator access token
+    await db.update_creator_access_token("new_access_789", 7200)
+    tokens = await db.get_creator_tokens()
+    results.append((
+        "Creator access token updated",
+        tokens["access_token"] == "new_access_789" and tokens["refresh_token"] == "refresh456",
+        "",
+    ))
+
     await db.clear_creator_tokens()
     tokens_after = await db.get_creator_tokens()
     results.append(("Creator tokens cleared", tokens_after is None, ""))
@@ -106,6 +130,8 @@ async def run_tests():
 
     # Cleanup
     await db.close_db()
+    if os.path.exists(_test_db):
+        os.unlink(_test_db)
 
     # Print results
     passed = sum(1 for _, ok, _ in results if ok)
@@ -113,13 +139,13 @@ async def run_tests():
     sep = "=" * 60
     print("")
     print(sep)
-    print("TEST RESULTS: " + str(passed) + " passed, " + str(failed) + " failed out of " + str(len(results)))
+    print(f"TEST RESULTS: {passed} passed, {failed} failed out of {len(results)}")
     print(sep)
     for name, ok, detail in results:
         status = "PASS" if ok else "FAIL"
-        line = "  [" + status + "] " + name
+        line = f"  [{status}] {name}"
         if detail:
-            line += " (" + detail + ")"
+            line += f" ({detail})"
         print(line)
 
     if failed:

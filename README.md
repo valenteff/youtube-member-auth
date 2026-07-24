@@ -127,11 +127,11 @@ http://localhost:8000/auth/google/callback
 http://localhost:8000/admin/google/callback
 ```
 
-Then open in your browser:
+Then authenticate with curl (the browser can't send the required admin header):
+```bash
+curl -L -H "X-Admin-Key: your-admin-key" \
+     http://localhost:8000/admin/login
 ```
-http://localhost:8000/admin/login
-```
-(Note: pass the `X-Admin-Key` header to authenticate)
 
 After successful creator auth, you'll see:
 ```json
